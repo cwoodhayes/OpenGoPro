@@ -14,7 +14,6 @@ from typing import Any, Callable, Optional, Pattern
 
 import bleak
 import pexpect
-from bleak.assigned_numbers import CharacteristicPropertyName
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice as BleakDevice
 from bleak.backends.scanner import AdvertisementData
@@ -71,13 +70,10 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
 
     Args:
         exception_handler (Callable | None): Used to catch asyncio exceptions from other tasks. Defaults to None.
-        rich_gatt_querying (bool): If True, read descriptor values during GATT discovery. This provides
-            richer data for GATT CSV exports but may fail on some camera firmware. Defaults to False.
     """
 
-    def __init__(self, exception_handler: Callable | None = None, rich_gatt_querying: bool = False) -> None:
-        BLEController.__init__(self, exception_handler, rich_gatt_querying)
-        self._ble_op_lock = asyncio.Lock()
+    def __init__(self, exception_handler: Callable | None = None) -> None:
+        BLEController.__init__(self, exception_handler)
 
     async def read(self, handle: bleak.BleakClient, uuid: BleUUID) -> bytearray:
         """Read data from a BleUUID.
@@ -89,13 +85,14 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
         Returns:
             bytearray: read data
         """
-        async with self._ble_op_lock:
-            logger.debug(f"Reading from {uuid}")
-            response = await handle.read_gatt_char(uuid2bleak_string(uuid))
-            logger.debug(f'Received response on BleUUID [{uuid}]: {response.hex(":")}')
-            return response
+        logger.debug(f"Reading from {uuid}")
+        response = await handle.read_gatt_char(uuid2bleak_string(uuid))
+        logger.debug(f"Received response on BleUUID [{uuid}]: {response.hex(':')}")
+        return response
 
-    async def write(self, handle: bleak.BleakClient, uuid: BleUUID, data: bytes) -> None:
+    async def write(
+        self, handle: bleak.BleakClient, uuid: BleUUID, data: bytes
+    ) -> None:
         """Write data to a BleUUID.
 
         Args:
@@ -103,12 +100,14 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
             uuid (BleUUID): characteristic BleUUID to write to
             data (bytes): data to write
         """
-        async with self._ble_op_lock:
-            logger.debug(f"Writing to {uuid}: {uuid.hex}")
-            await handle.write_gatt_char(uuid2bleak_string(uuid), data, response=True)
+        logger.debug(f"Writing to {uuid}: {uuid.hex}")
+        await handle.write_gatt_char(uuid2bleak_string(uuid), data, response=True)
 
     async def scan(
-        self, token: Pattern, timeout: int = 5, service_uuids: Optional[list[BleUUID]] = None
+        self,
+        token: Pattern,
+        timeout: int = 5,
+        service_uuids: Optional[list[BleUUID]] = None,
     ) -> BleakDevice:
         """Scan for a regex in advertising data strings, optionally filtering on service BleUUID's
 
@@ -123,40 +122,28 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
         Returns:
             BleakDevice: The first matched device that was discovered
         """
-        stop_event = asyncio.Event()
         logger.info(f"Scanning for {token.pattern} bluetooth devices...")
-        devices: dict[str, BleakDevice] = {}
-        uuids = [] if service_uuids is None else [uuid2bleak_string(uuid) for uuid in service_uuids]
-
-        def scan_callback(device: BleakDevice, adv_data: AdvertisementData) -> None:
-            """Only keep devices that have a device name token
-
-            Args:
-                device (BleakDevice): discovered device
-                adv_data (AdvertisementData): advertisement (and / or scan response) data
-            """
-            if (name := adv_data.local_name or device.name) and name not in devices:
-                devices[name] = device
-                logger.info(f"\tDiscovered: {device}")
-                matched_devices = [device for name, device in devices.items() if token.match(name)]
-                if matched_devices:
-                    stop_event.set()
-
-        # Now get list of connectable advertisements
-        async with bleak.BleakScanner(timeout=timeout, detection_callback=scan_callback, service_uuids=uuids):
-            # The bleak scan timeout appears to not be used at least in some versions of bleak
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout)
-            except asyncio.TimeoutError as e:
-                raise FailedToFindDevice from e
-        # Now look for our matching device(s)
-        if not (matched_devices := [device for name, device in devices.items() if token.match(name)]):
+        # PATCH: the original detection_callback + BleakScanner context manager
+        # approach does not reliably deliver advertisement events on BlueZ 5.80+
+        # with some bleak versions. Using BleakScanner.discover() directly works
+        # (confirmed by a standalone reproduction), so we use that instead.
+        discovered = await bleak.BleakScanner.discover(timeout=timeout, return_adv=True)
+        matched_devices: list[BleakDevice] = []
+        for _addr, (device, adv) in discovered.items():
+            name = adv.local_name or device.name
+            if name:
+                logger.info(f"\tDiscovered: {device.address} name={name!r}")
+                if token.match(name):
+                    matched_devices.append(device)
+        if not matched_devices:
             raise FailedToFindDevice
         logger.info(f"Found {len(matched_devices)} matching devices.")
         # If there's more than 1, the first one gets lucky.
         return matched_devices[0]
 
-    async def connect(self, disconnect_cb: Callable, device: BleakDevice, timeout: int = 15) -> bleak.BleakClient:
+    async def connect(
+        self, disconnect_cb: Callable, device: BleakDevice, timeout: int = 15
+    ) -> bleak.BleakClient:
         """Connect to a device.
 
         Args:
@@ -191,7 +178,9 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
                     *args (Any): passed through
                 """
                 # pylint: disable=expression-not-assigned
-                self._client_cb(args) if self._should_use_client_cb else self._connecting_cb(args)
+                self._client_cb(
+                    args
+                ) if self._should_use_client_cb else self._connecting_cb(args)
 
             @property
             def did_fail(self) -> bool:
@@ -223,11 +212,16 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
 
         connect_session = ConnectSession(disconnect_cb)
         client = bleak.BleakClient(
-            device, disconnected_callback=connect_session.disconnect_cb, use_cached=False, timeout=timeout
+            device,
+            disconnected_callback=connect_session.disconnect_cb,
+            use_cached=False,
+            timeout=timeout,
         )
         exception = None
         try:
-            task_connect: asyncio.Task = asyncio.create_task(client.connect(timeout=timeout), name="connect")
+            task_connect: asyncio.Task = asyncio.create_task(
+                client.connect(timeout=timeout), name="connect"
+            )
             task_disconnected: asyncio.Task = asyncio.create_task(
                 connect_session.catch_connection_failure(), name="disconnect"
             )
@@ -285,17 +279,26 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
                 else:
                     bluetoothctl.sendline("paired-devices")
                     bluetoothctl.expect("paired-devices")
-                bluetoothctl.expect(r"#")
+                # PATCH: bluetoothctl on BlueZ 5.66+ uses prompts like
+                # "[bluetooth]>" or "[DeviceName]>", never "#". Match either
+                # so this works on both old and new systems.
+                bluetoothctl.expect(r"#|\]>")
                 for device in bluetoothctl.before.decode("utf-8").splitlines():
                     if "Device" in device and device.split()[1] == handle.address:
                         break  # The device is already paired
                 else:
                     # We're not paired so do it now
                     bluetoothctl.sendline(f"pair {handle.address}")
-                    if (match := bluetoothctl.expect(["Accept pairing", "Pairing successful"])) == 0:
+                    if (
+                        match := bluetoothctl.expect(
+                            ["Accept pairing", "Pairing successful"]
+                        )
+                    ) == 0:
                         bluetoothctl.sendline("yes")
                         bluetoothctl.expect("Pairing successful")
-                    elif match == 1:  # We received pairing successful so nothing else to do
+                    elif (
+                        match == 1
+                    ):  # We received pairing successful so nothing else to do
                         pass
 
             logger.debug(temp_file.read_bytes().decode("utf-8"))
@@ -308,7 +311,9 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
 
         logger.debug("Pairing complete!")
 
-    async def enable_notifications(self, handle: bleak.BleakClient, handler: NotiHandlerType) -> None:
+    async def enable_notifications(
+        self, handle: bleak.BleakClient, handler: NotiHandlerType
+    ) -> None:
         """Enable all notifications.
 
         Search through all characteristics and enable any that have notification property.
@@ -318,7 +323,9 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
             handler (NotiHandlerType): Notification callback handler
         """
 
-        def bleak_notification_cb_adapter(characteristic: BleakGATTCharacteristic, data: bytearray) -> None:
+        def bleak_notification_cb_adapter(
+            characteristic: BleakGATTCharacteristic, data: bytearray
+        ) -> None:
             """Adapt bleak notification callback signature to our interface signature
 
             Args:
@@ -335,7 +342,9 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
                     await handle.start_notify(char, bleak_notification_cb_adapter)
         logger.info("Done enabling notifications")
 
-    async def discover_chars(self, handle: bleak.BleakClient, uuids: type[UUIDs] | None = None) -> GattDB:
+    async def discover_chars(
+        self, handle: bleak.BleakClient, uuids: type[UUIDs] | None = None
+    ) -> GattDB:
         """Discover all characteristics for a connected handle.
 
         By default, the BLE controller only knows Spec-Defined BleUUID's so any additional BleUUID's should
@@ -350,11 +359,11 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
             GattDB: Gatt Database
         """
 
-        def bleak_props_adapter(bleak_props: list[CharacteristicPropertyName]) -> CharProps:
+        def bleak_props_adapter(bleak_props: list[str]) -> CharProps:
             """Convert a list of bleak string properties into a CharProps
 
             Args:
-                bleak_props (list[CharacteristicPropertyName]): bleak strings to convert
+                bleak_props (list[str]): bleak strings to convert
 
             Returns:
                 CharProps: converted Enum
@@ -380,31 +389,17 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
                 # Get any descriptors if they exist
                 descriptors: list[Descriptor] = []
                 for descriptor in char.descriptors:
-                    descriptor_uuid = (
-                        uuids[descriptor.uuid]
-                        if uuids and descriptor.uuid in uuids
-                        else BleUUID(descriptor.description, hex=descriptor.uuid)
-                    )
-                    # Only read descriptor values if rich_gatt_querying is enabled.
-                    # Some camera firmware returns None for descriptor values, which causes
-                    # bleak's CoreBluetooth backend to crash with an assertion error.
-                    # Descriptor values are only used for GATT CSV export, not SDK operations.
-                    descriptor_value: bytes | None = None
-                    if self._rich_gatt_querying:
-                        try:
-                            descriptor_value = await handle.read_gatt_descriptor(descriptor.handle)
-                        except Exception as e:  # pylint: disable=broad-exception-caught
-                            logger.warning(
-                                f"Could not read descriptor value for [{descriptor_uuid.name}] "
-                                f"(handle={descriptor.handle}, uuid={descriptor.uuid}) "
-                                f"on characteristic [{char.uuid}]: {type(e).__name__}: {e}. "
-                                f"This may indicate a camera firmware issue."
-                            )
                     descriptors.append(
                         Descriptor(
                             handle=descriptor.handle,
-                            uuid=descriptor_uuid,
-                            value=descriptor_value,
+                            uuid=(
+                                uuids[descriptor.uuid]
+                                if uuids and descriptor.uuid in uuids
+                                else BleUUID(
+                                    descriptor.description, hex=descriptor.uuid
+                                )
+                            ),
+                            value=await handle.read_gatt_descriptor(descriptor.handle),
                         )
                     )
                 # Create new characteristic
@@ -423,7 +418,11 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
                 logger.debug(f"\t[Characteristic] {chars[-1]}")
 
             # Create new service
-            services.append(Service(uuid=service_uuid, start_handle=service.handle, init_chars=chars))
+            services.append(
+                Service(
+                    uuid=service_uuid, start_handle=service.handle, init_chars=chars
+                )
+            )
 
         logger.info("Done discovering characteristics!")
         return GattDB(services)
