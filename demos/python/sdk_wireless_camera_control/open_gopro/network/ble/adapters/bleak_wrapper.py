@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional, Pattern
 
 import bleak
 import pexpect
+from bleak.assigned_numbers import CharacteristicPropertyName
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice as BleakDevice
 from bleak.backends.scanner import AdvertisementData
@@ -70,10 +71,17 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
 
     Args:
         exception_handler (Callable | None): Used to catch asyncio exceptions from other tasks. Defaults to None.
+        rich_gatt_querying (bool): If True, read descriptor values during GATT discovery. This provides
+            richer data for GATT CSV exports but may fail on some camera firmware. Defaults to False.
     """
 
-    def __init__(self, exception_handler: Callable | None = None) -> None:
-        BLEController.__init__(self, exception_handler)
+    def __init__(
+        self,
+        exception_handler: Callable | None = None,
+        rich_gatt_querying: bool = False,
+    ) -> None:
+        BLEController.__init__(self, exception_handler, rich_gatt_querying)
+        self._ble_op_lock = asyncio.Lock()
 
     async def read(self, handle: bleak.BleakClient, uuid: BleUUID) -> bytearray:
         """Read data from a BleUUID.
@@ -85,10 +93,11 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
         Returns:
             bytearray: read data
         """
-        logger.debug(f"Reading from {uuid}")
-        response = await handle.read_gatt_char(uuid2bleak_string(uuid))
-        logger.debug(f"Received response on BleUUID [{uuid}]: {response.hex(':')}")
-        return response
+        async with self._ble_op_lock:
+            logger.debug(f"Reading from {uuid}")
+            response = await handle.read_gatt_char(uuid2bleak_string(uuid))
+            logger.debug(f"Received response on BleUUID [{uuid}]: {response.hex(':')}")
+            return response
 
     async def write(
         self, handle: bleak.BleakClient, uuid: BleUUID, data: bytes
@@ -100,8 +109,9 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
             uuid (BleUUID): characteristic BleUUID to write to
             data (bytes): data to write
         """
-        logger.debug(f"Writing to {uuid}: {uuid.hex}")
-        await handle.write_gatt_char(uuid2bleak_string(uuid), data, response=True)
+        async with self._ble_op_lock:
+            logger.debug(f"Writing to {uuid}: {uuid.hex}")
+            await handle.write_gatt_char(uuid2bleak_string(uuid), data, response=True)
 
     async def scan(
         self,
@@ -359,11 +369,13 @@ class BleakWrapperController(BLEController[BleakDevice, bleak.BleakClient], Sing
             GattDB: Gatt Database
         """
 
-        def bleak_props_adapter(bleak_props: list[str]) -> CharProps:
+        def bleak_props_adapter(
+            bleak_props: list[CharacteristicPropertyName],
+        ) -> CharProps:
             """Convert a list of bleak string properties into a CharProps
 
             Args:
-                bleak_props (list[str]): bleak strings to convert
+                bleak_props (list[CharacteristicPropertyName]): bleak properties to convert
 
             Returns:
                 CharProps: converted Enum
