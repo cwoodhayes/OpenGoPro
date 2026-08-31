@@ -1,3 +1,6 @@
+# Fork Information
+This is a fork of Open GoPro that supports Debian Trixie (and its downstream Raspberry Pi OS versions). It contains a bugfix without which the library cannot connect over BLE to a GoPro.
+
 # Open GoPro Developer README
 
 Current Version: 2.0
